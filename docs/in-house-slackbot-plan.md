@@ -7,11 +7,13 @@ OpenTag as the architectural starting point.
 
 > **TL;DR.** OpenTag gives us ~80% of the skeleton for free: the Slack
 > connection, the agent/runtime split, the MCP-based tool-wiring loop, and the
-> human-in-the-loop approval gate. The ~20% we have to build ourselves is the
-> part OpenTag deliberately doesn't have — a **per-user credential layer** so
-> each person acts as themselves in Gmail, Drive, Ramp, and QuickBooks instead
-> of through one shared service account. This plan is organized around closing
-> that gap safely.
+> human-in-the-loop approval gate. The part we build ourselves is the part
+> OpenTag deliberately doesn't have — **authorization**. Our model is a simple
+> **two tiers**: admins (Davis + Clark) can search everything; everyone else can
+> search everything *except* Davis's and Clark's private communications (email,
+> texts, etc.). The trick is enforcing that at the tool-provisioning layer — the
+> protected tools are simply not loaded for standard users — so the LLM is never
+> the security boundary. This plan is organized around getting that right.
 
 ---
 
@@ -45,44 +47,52 @@ tool list) and the triage-specific system prompt.
 
 ---
 
-## 2. The gap we must close: per-user authorization
+## 2. The gap we must close: a two-tier authorization model
 
 This is the heart of the project and the reason a plain OpenTag clone is not
 enough.
 
 **OpenTag is multi-user in *attribution* only, not *authorization*.** It knows
-who is asking (passes their email as context) but every tool call uses **one
-shared service-account credential** — a single `LINEAR_API_KEY`, a single
-`NOTION_TOKEN` (`runtime.ts:77-98`). Its own prompt concedes this: *"issues are
-still authored by the bot's API key… assignee is how you attribute work to the
-requester"* (`runtime.ts:195-197`).
+who is asking (passes their email as context) but it applies **no access
+control** — whatever the bot's credentials can reach, any user can ask for
+(`runtime.ts:77-98`). We need real authorization on top.
 
-For our toolset that splits into two camps:
+Our model is **two roles + a protected-resource set** — not per-employee OAuth:
 
-### Camp A — per-user identity is required (build the credential broker)
-These tools expose data that is private *per person*, or take actions that must
-be attributable to a real human. The bot must act **as the requesting user**,
-with that user's own permissions:
+### Roles
+- **Admin** = **Davis + Clark.** Can search **everything**, including their own
+  and each other's private communications.
+- **Standard** = **everyone else.** Can search everything **except** Davis's and
+  Clark's private communications.
 
-- **Gmail** — reading/sending mail as the user. Never a shared mailbox.
-- **Google Drive / Calendar** — a user sees only the docs/events they have access to.
-- **Ramp** — spend, cards, reimbursements, approvals tied to the individual.
-- **QuickBooks** — accounting actions must be attributable; scope by role.
+### Protected resources (admin-only)
+The *only* thing gated is **leadership's private communications**:
+- Davis's and Clark's **email** (Gmail).
+- Davis's and Clark's **texts / SMS** (whatever SMS source we connect).
+- "…etc." — to be enumerated: e.g. their private Drive files, DMs, personal
+  calendars. **We need a precise list** (see open decisions).
 
-### Camp B — a shared service account is acceptable
-Org-wide resources where "the bot" acting as one integration identity is fine
-(we still gate writes and log who triggered them):
+Everything else — shared company tools (Asana, Notion, QuickBooks, Ramp,
+Jotform, Drive shared with the org, etc.) — is searchable by **all** users.
 
-- **Asana** — org workspace (use the requester's email to set assignee/attribution, OpenTag-style).
-- **Notion** — shared workspace.
-- **Jotform** — org forms.
-- **Zapier** — org automation surface.
+### How enforcement works (the critical design rule)
+Authorization is enforced at the **tool-provisioning layer, never by asking the
+LLM to behave.** Concretely, in `mcpTransports()` (`runtime.ts:75`):
 
-**Design implication:** `mcpTransports()` in `runtime.ts` must become
-**dynamic per-turn** — instead of reading one static key from env, it looks up
-the requesting Slack user's stored tokens and injects the right credential into
-each MCP transport's `Authorization` header. Camp B tools keep using a static
-org credential.
+- **Admin turn** → load all transports, including the protected mailboxes/SMS.
+- **Standard turn** → the protected transports are **simply not loaded**. The
+  model literally has no tool that can reach Davis's or Clark's mail, so it
+  cannot leak it even under a jailbreak or prompt-injection attempt. (This reuses
+  OpenTag's graceful-degradation pattern: a missing tool just isn't there.)
+
+This is far more robust than a shared credential + "please don't show this to
+non-admins" instruction, which an injected message could defeat. **The LLM is
+never the security boundary; tool provisioning is.**
+
+> Note: this is *coarser and simpler* than the per-user-OAuth design in earlier
+> drafts. We do **not** need every one of ~N employees to connect their own
+> Google account. We need: (1) the bot connected to Davis's and Clark's
+> mailboxes/SMS, and (2) a role check that withholds those from standard users.
 
 ---
 
@@ -101,32 +111,40 @@ org credential.
    │                          runtime (the brain)                        │
    │   per turn:                                                         │
    │     1. read Slack user id from context                              │
-   │     2. credential broker → that user's OAuth tokens (Camp A)        │
-   │     3. build MCP transports: per-user header (A) + org header (B)   │
+   │     2. role lookup → admin (Davis/Clark) or standard               │
+   │     3. build MCP transports:                                        │
+   │          • shared org tools          → ALWAYS loaded                │
+   │          • leadership mail / SMS      → loaded ONLY if admin        │
    │     4. run LLM tool loop; gate every write through confirm_write    │
    └───────────────┬───────────────────────────────────────────────────┘
                    │
-       ┌───────────┼───────────────┬───────────────┬──────────────┐
-       ▼           ▼               ▼               ▼              ▼
-   Gmail MCP   Drive/Cal MCP   Ramp MCP      QuickBooks MCP   Asana/Notion/…
-   (per-user)  (per-user)      (per-user)    (per-user)       (org token)
+       ┌───────────┼─────────────────┬──────────────────────────────┐
+       ▼           ▼                 ▼                              ▼
+   Asana/Notion/  QuickBooks/Ramp/   Davis+Clark Gmail            Davis+Clark
+   Drive (shared) Jotform (shared)   (admin-only)                 SMS (admin-only)
+   ── all users ────────────────────┤ withheld from standard turns ┤
 ```
 
-### New component: the credential broker
-The one piece OpenTag doesn't have. Responsibilities:
+### New component: the authorization layer
+The one piece OpenTag doesn't have. It's small — a role check, not a per-user
+OAuth system:
 
-- **Store** per-user OAuth tokens, encrypted at rest (e.g. Postgres + envelope
-  encryption, or a secrets manager). Key: Slack user id (+ tool).
-- **Refresh** expired access tokens using stored refresh tokens.
-- **Link flow**: first time a user invokes a Camp-A tool with no token on file,
-  the bot replies with an ephemeral "Connect your Google account" / "Connect
-  Ramp" OAuth link; the callback stores tokens against their Slack id.
-- **Inject**: on each turn, hand the runtime the right `Authorization` header
-  per Camp-A transport. Missing/expired token → that tool is simply absent for
-  that turn (OpenTag's graceful-degradation pattern already handles a missing
-  tool cleanly).
+- **Role map.** Static config: `{ admins: [<Davis Slack id>, <Clark Slack id>] }`.
+  Everyone else is `standard`. (Start as a config file/env; can move to a table
+  later if roles grow.)
+- **Protected-resource registry.** A list of MCP transports tagged
+  `adminOnly: true` — Davis's mailbox, Clark's mailbox, their SMS source, plus
+  whatever else lands in the "etc." list.
+- **Per-turn provisioning.** `mcpTransports(role)` becomes role-aware: it always
+  includes the shared tools and includes `adminOnly` transports **only when
+  `role === "admin"`.** A standard turn never receives those clients, so the
+  model cannot surface that data no matter what the prompt says.
+- **Credentials.** The bot connects to Davis's and Clark's Gmail/SMS via their
+  own OAuth grant (each grants once) or Google Workspace domain-wide delegation.
+  These are org-held bot credentials, not something every employee sets up.
 
-This is the bulk of the net-new engineering. Everything else is OpenTag glue.
+This is the bulk of the net-new engineering, and it's deliberately simple.
+Everything else is OpenTag glue.
 
 ---
 
@@ -135,47 +153,61 @@ This is the bulk of the net-new engineering. Everything else is OpenTag glue.
 Property management touches financials (Ramp/QuickBooks) and PII (Gmail/Drive),
 so this is not optional:
 
-- **Least privilege per tool.** Request the narrowest OAuth scopes that work
-  (e.g. Gmail `gmail.send` + `gmail.readonly` rather than full mail).
-- **Token encryption at rest** and short-lived access tokens; never log tokens.
+- **Authorization is provisioning, not prompting.** The single most important
+  rule: standard-user turns must *never have the protected tools loaded*. Do not
+  rely on a system-prompt instruction like "don't show leadership's mail to
+  non-admins" — a crafted message could override it. Enforce in code, in
+  `mcpTransports(role)`.
+- **Resolve role from the true requester.** Use the Slack user id of whoever
+  invoked the bot — not the channel, not who's watching. Confirm the id can't be
+  spoofed (Slack events are signed; verify signatures).
+- **Least privilege per tool.** Narrowest OAuth scopes that work (e.g. Gmail
+  `gmail.readonly` for search-only; add `gmail.send` only if we let it send).
+- **Token encryption at rest** for the leadership mailbox/SMS credentials; never
+  log tokens.
 - **Confirm-gate every write**, no exceptions, for Ramp / QuickBooks / Gmail-send.
   Reuse `confirm_write` and show the exact action + amount/recipient in the card.
-- **Audit log**: every tool call → who (Slack id), what tool, what args summary,
-  approved-by, timestamp. Independent of the LLM transcript.
-- **Channel scoping**: decide whether the bot answers in any channel or only in
-  approved ones; DMs by default carry the requester's own auth.
+- **Audit log**: every tool call → who (Slack id + role), what tool, what args
+  summary, approved-by, timestamp. Independent of the LLM transcript. This is also
+  how we'd catch a standard user *attempting* to reach protected data.
 - **Data residency**: charts render locally (good); confirm the LLM provider
-  choice (OpenAI vs Anthropic vs Google) against our data-handling policy. Model
-  is a one-line env swap (`AGENT_MODEL`).
+  choice against our data policy. Model is a one-line env swap (`AGENT_MODEL`).
 - **Prompt-injection posture**: thread/email/doc content is untrusted input.
-  Keep write-gating human-in-the-loop so an injected "send money to X" can't
-  execute without a person clicking Approve.
+  Two defenses cover the worst cases — (1) protected tools absent for standard
+  users, and (2) human-in-the-loop on writes — so neither "leak leadership's
+  mail" nor "send money to X" can fire without the right role + a human click.
 
 ---
 
 ## 5. Phased rollout
 
-### Phase 0 — Foundation (skeleton, no per-user auth yet)
+### Phase 0 — Foundation (skeleton, all-access)
 - Fork OpenTag's `app/` + `runtime.ts` into a clean in-house repo.
 - Strip Linear/Notion; rewrite the system prompt for our org.
 - Stand up bot + runtime; confirm an @mention round-trips with the LLM.
-- Wire **one Camp-B tool with a shared org token** (Asana or Notion) to prove
-  the MCP loop end-to-end.
+- Wire **one shared-token tool** (Asana or Notion) to prove the MCP loop
+  end-to-end. No role gating yet — everyone can search it.
 - **Exit criteria:** "@bot what are my open Asana tasks" returns a rendered card.
 
-### Phase 1 — Credential broker + first per-user tool
-- Build the token store + OAuth link flow + refresh.
-- Make `mcpTransports()` per-turn dynamic.
-- Wire **Gmail** as the first Camp-A tool (high value, clear per-user boundary).
-- Confirm two different Slack users see *their own* mail.
-- **Exit criteria:** two users, two mailboxes, correct isolation; missing-token
-  users get a "connect your account" prompt.
+### Phase 1 — The two-tier role gate (the core requirement)
+- Add the **role map** (admins = Davis + Clark) and **protected-resource
+  registry** (`adminOnly` transports).
+- Make `mcpTransports(role)` role-aware: shared tools always; `adminOnly` tools
+  only on admin turns. Forward the resolved role from bot → runtime in context.
+- Connect Davis's + Clark's **Gmail** as the first protected resource.
+- **Exit criteria:** an admin can search Davis's/Clark's mail; a standard user
+  asking the same gets "I don't have access to that" because the tool was never
+  loaded — verified to hold even against a deliberate prompt-injection attempt.
 
 ### Phase 2 — Breadth
-- Add Google Calendar + Drive (same Google OAuth, more scopes).
-- Add Ramp and QuickBooks behind hard confirm-gates.
-- Add remaining Camp-B tools (Jotform, Zapier).
-- Audit logging live for every write.
+- Add Davis's + Clark's **SMS/texts** as a protected resource (pick the SMS
+  source — see open decisions).
+- Enumerate and add the rest of the "etc." protected set (private Drive,
+  calendars, DMs) if in scope.
+- Add the remaining **shared** tools: QuickBooks, Ramp, Jotform, shared Drive,
+  Calendar, Zapier — all searchable by everyone.
+- Hard **confirm-gate every write** (Ramp/QuickBooks/Gmail-send) and turn on
+  audit logging.
 
 ### Phase 3 — Hardening & rollout
 - Persistence (Redis store, per OpenTag's `demo-restart` pattern) so approval
@@ -187,15 +219,27 @@ so this is not optional:
 
 ## 6. Open decisions (need your input)
 
-1. **Hosting**: where do bot + runtime + token DB run? (Our cloud / Railway /
-   etc.) Drives the OAuth callback URL and secrets management.
-2. **LLM provider**: OpenAI, Anthropic, or Google — per our data policy.
-3. **Tool priority order** for Phase 2 (which of Ramp/QuickBooks/Calendar/Drive
-   first).
-4. **MCP sourcing**: use each vendor's official hosted MCP where it exists
-   (lowest maintenance), self-host sidecars (OpenTag's Notion pattern), or route
-   some via Zapier's MCP (9,000+ apps, one integration). Likely a mix.
-5. **Channel scope**: org-wide, or allowlisted channels + DMs only.
+1. **Confirm the role map**: admins are exactly Davis + Clark, correct? Anyone
+   else (e.g. an ops/finance lead) who should be admin?
+2. **Enumerate "…etc."**: beyond Davis's & Clark's email and texts, what else is
+   admin-only? Private Drive files? Personal calendars? Slack DMs? Be explicit —
+   anything not on the protected list is searchable by everyone.
+3. **SMS/texts source**: what carries your texts? (e.g. Google Voice, a business
+   SMS platform, iMessage export, Twilio.) This determines whether there's an MCP
+   / API to connect at all, and is the trickiest integration.
+4. **Standard-user data scope**: when a standard user "searches everything,"
+   does that include *other employees'* mailboxes, or only shared company tools
+   plus their own? (i.e. is anyone's mail searchable besides leadership's?)
+5. **Hosting**: where do bot + runtime + role/token store run? Drives the OAuth
+   callback URL and secrets management.
+6. **LLM provider**: OpenAI, Anthropic, or Google — per our data policy.
+7. **MCP sourcing**: official hosted MCP per vendor (lowest maintenance),
+   self-hosted sidecars (OpenTag's Notion pattern), or Zapier's MCP (9,000+ apps,
+   one integration). Likely a mix.
+8. **Channel scope**: org-wide, or allowlisted channels + DMs only. (Note:
+   role-gating must work in *public* channels too — if a standard user @mentions
+   the bot in a channel where an admin is present, the requester's role is what
+   counts, not who's watching.)
 
 ---
 
@@ -204,9 +248,10 @@ so this is not optional:
 | Phase | Scope | Rough effort |
 |---|---|---|
 | 0 | Skeleton + 1 shared-token tool | ~few days |
-| 1 | Credential broker + Gmail per-user | ~1–2 weeks (the hard part) |
-| 2 | Remaining tools + audit log | ~1–2 weeks |
+| 1 | Two-tier role gate + leadership Gmail | ~1 week |
+| 2 | SMS + remaining tools + audit log | ~1–2 weeks |
 | 3 | Hardening, persistence, rollout | ~1 week |
 
-The credential broker in Phase 1 is the critical path and the main risk; the
-rest is largely OpenTag glue plus per-tool OAuth wiring.
+The role gate in Phase 1 is the core requirement but is genuinely small (a role
+check + conditional transport loading). The larger unknown is the **SMS/texts**
+source in Phase 2 — that integration may or may not exist off the shelf.
