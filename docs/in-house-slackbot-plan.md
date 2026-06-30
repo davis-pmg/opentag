@@ -59,40 +59,79 @@ control** — whatever the bot's credentials can reach, any user can ask for
 
 Our model is **two roles + a protected-resource set** — not per-employee OAuth:
 
-### Roles
-- **Admin** = **Davis + Clark.** Can search **everything**, including their own
-  and each other's private communications.
+### Roles (confirmed)
+- **Admin** = **Davis + Clark only.** No one else. Can search **everything**,
+  including their own and each other's private communications.
 - **Standard** = **everyone else.** Can search everything **except** Davis's and
   Clark's private communications.
 
-### Protected resources (admin-only)
-The *only* thing gated is **leadership's private communications**:
+### Protected resources (admin-only) — confirmed list
 - Davis's and Clark's **email** (Gmail).
-- Davis's and Clark's **texts / SMS** (whatever SMS source we connect).
-- "…etc." — to be enumerated: e.g. their private Drive files, DMs, personal
-  calendars. **We need a precise list** (see open decisions).
+- Davis's and Clark's **texts** (sent/received via **RingCentral API**).
+- Davis's and Clark's **private/shared Google Drives**.
 
-Everything else — shared company tools (Asana, Notion, QuickBooks, Ramp,
-Jotform, Drive shared with the org, etc.) — is searchable by **all** users.
+### Standard-user reach (confirmed) — and the catch
+Standard users can search **broadly, including other employees' mailboxes** —
+not just shared company tools and their own mail. The denylist is just two
+people: Davis and Clark.
 
-### How enforcement works (the critical design rule)
-Authorization is enforced at the **tool-provisioning layer, never by asking the
-LLM to behave.** Concretely, in `mcpTransports()` (`runtime.ts:75`):
+**This makes the boundary leaky, and it's the most important thing to resolve
+before building.** Email is two-sided: a message Clark sends to an employee
+lives in *both* Clark's mailbox *and* that employee's mailbox. If standard users
+can search that employee's mailbox, they can read Clark's message through it —
+"don't load Clark's mailbox" does **not** hide it. The only correspondence truly
+hidden is mail purely between Davis and Clark (or with parties whose mailboxes
+aren't searchable). See [§2a](#2a-the-mailbox-boundary-problem) — we need a call
+here.
 
-- **Admin turn** → load all transports, including the protected mailboxes/SMS.
-- **Standard turn** → the protected transports are **simply not loaded**. The
-  model literally has no tool that can reach Davis's or Clark's mail, so it
-  cannot leak it even under a jailbreak or prompt-injection attempt. (This reuses
-  OpenTag's graceful-degradation pattern: a missing tool just isn't there.)
+### How enforcement works (the design rule)
+Authorization is enforced at the **tool-provisioning / tool-wrapper layer, never
+by asking the LLM to behave.** Two mechanisms, depending on the resource:
 
-This is far more robust than a shared credential + "please don't show this to
-non-admins" instruction, which an injected message could defeat. **The LLM is
-never the security boundary; tool provisioning is.**
+- **Whole-resource gating** (Drives, SMS): the protected transport is **simply
+  not loaded** on a standard turn. The model has no tool that can reach Davis's
+  or Clark's Drive/texts, so it can't leak them even under prompt injection. This
+  reuses OpenTag's graceful-degradation pattern (a missing tool just isn't there)
+  and is airtight.
+- **Mailbox filtering** (Gmail): because standard users *can* search other
+  mailboxes, we can't just withhold Gmail. We need a **wrapper tool in front of
+  Gmail** that injects the requester's role and, for standard users, hard-scopes
+  the query to exclude Davis's and Clark's mailboxes. This is real net-new code
+  and is only a *partial* fix because of the two-sided-email catch above.
 
-> Note: this is *coarser and simpler* than the per-user-OAuth design in earlier
-> drafts. We do **not** need every one of ~N employees to connect their own
-> Google account. We need: (1) the bot connected to Davis's and Clark's
-> mailboxes/SMS, and (2) a role check that withholds those from standard users.
+**The LLM is never the security boundary; the transport/wrapper layer is.**
+
+---
+
+## 2a. The mailbox-boundary problem (needs a decision)
+
+Goal: standard users **cannot read Davis's or Clark's email.** Reality: standard
+users **can** search other employees' mailboxes. These two collide, because
+every email exists in at least two mailboxes (sender + each recipient).
+
+So if Clark emails an employee, that message sits in the employee's mailbox too.
+A standard user searching that employee's mail finds it — even though we never
+loaded Clark's mailbox. **Excluding leadership's mailboxes hides almost nothing
+in practice.** Three ways to resolve it, cleanest first:
+
+- **Option A — narrow standard reach (recommended).** Standard users get shared
+  company tools + their **own** mailbox only, not all-staff mail. Then "hide
+  Davis/Clark's mail" is a clean, airtight tool-gate. (This walks back part of
+  answer #4 — flagging it because it's the only option that actually delivers the
+  stated goal cheaply.)
+- **Option B — message-level redaction.** Keep all-staff search, but the Gmail
+  wrapper drops any message where Davis or Clark is a participant (from/to/cc),
+  in *any* mailbox. Achievable but more code, slower searches, and easy to get
+  subtly wrong (forwards, quoted replies, alias addresses).
+- **Option C — accept the leak.** Keep all-staff search, only withhold the two
+  mailboxes directly. Cheapest to build, but understand that leadership's
+  correspondence with any employee remains discoverable. Probably **not** what
+  "they can't read our emails" is meant to achieve.
+
+There's also a **broader privacy question** worth a conscious decision: letting
+all staff search each other's mailboxes (any option that keeps all-staff search)
+is a significant surveillance capability with possible legal/HR implications.
+Recommend confirming this is intended regardless of which option we pick.
 
 ---
 
@@ -112,39 +151,45 @@ never the security boundary; tool provisioning is.**
    │   per turn:                                                         │
    │     1. read Slack user id from context                              │
    │     2. role lookup → admin (Davis/Clark) or standard               │
-   │     3. build MCP transports:                                        │
+   │     3. provision tools by role:                                     │
    │          • shared org tools          → ALWAYS loaded                │
-   │          • leadership mail / SMS      → loaded ONLY if admin        │
+   │          • leadership Drives / SMS    → loaded ONLY if admin         │
+   │          • Gmail wrapper              → role passed in; standard     │
+   │                                          turns exclude D&C mailboxes │
    │     4. run LLM tool loop; gate every write through confirm_write    │
    └───────────────┬───────────────────────────────────────────────────┘
                    │
-       ┌───────────┼─────────────────┬──────────────────────────────┐
-       ▼           ▼                 ▼                              ▼
-   Asana/Notion/  QuickBooks/Ramp/   Davis+Clark Gmail            Davis+Clark
-   Drive (shared) Jotform (shared)   (admin-only)                 SMS (admin-only)
-   ── all users ────────────────────┤ withheld from standard turns ┤
+       ┌───────────┼───────────────┬───────────────┬──────────────────┐
+       ▼           ▼               ▼               ▼                  ▼
+   Asana/Notion/  QuickBooks/     Gmail wrapper   Davis+Clark        Davis+Clark
+   shared Drive   Ramp/Jotform    (role-scoped)   private Drives     SMS/RingCentral
+   ── all users ──────────────┤   see §2a        (admin-only)       (admin-only)
+                                  ── withheld from standard turns ──┤
 ```
 
 ### New component: the authorization layer
-The one piece OpenTag doesn't have. It's small — a role check, not a per-user
-OAuth system:
+The one piece OpenTag doesn't have. Mostly a role check; the Gmail wrapper is the
+one non-trivial part (see §2a):
 
 - **Role map.** Static config: `{ admins: [<Davis Slack id>, <Clark Slack id>] }`.
-  Everyone else is `standard`. (Start as a config file/env; can move to a table
-  later if roles grow.)
-- **Protected-resource registry.** A list of MCP transports tagged
-  `adminOnly: true` — Davis's mailbox, Clark's mailbox, their SMS source, plus
-  whatever else lands in the "etc." list.
-- **Per-turn provisioning.** `mcpTransports(role)` becomes role-aware: it always
-  includes the shared tools and includes `adminOnly` transports **only when
-  `role === "admin"`.** A standard turn never receives those clients, so the
-  model cannot surface that data no matter what the prompt says.
-- **Credentials.** The bot connects to Davis's and Clark's Gmail/SMS via their
-  own OAuth grant (each grants once) or Google Workspace domain-wide delegation.
-  These are org-held bot credentials, not something every employee sets up.
+  Everyone else is `standard`. (Start as a config file/env; move to a table if it
+  ever grows — confirmed it won't for now.)
+- **Protected-resource registry.** Transports tagged `adminOnly: true` — Davis's
+  & Clark's **private/shared Drives** and their **RingCentral SMS**. These are
+  whole-resource gated (not loaded for standard turns) → airtight.
+- **Gmail wrapper.** Not whole-resource gated, because standard users *can* search
+  other mailboxes. A wrapper tool receives the role and, for standard users,
+  scopes the query to exclude Davis's & Clark's mailboxes — a partial control;
+  see the §2a boundary problem and pick an option there.
+- **Per-turn provisioning.** `provisionTools(role)` includes shared tools always,
+  `adminOnly` transports only when `role === "admin"`, and passes role into the
+  Gmail wrapper.
+- **Credentials.** Likely **Google Workspace domain-wide delegation** for a single
+  bot service account that can read any company mailbox/Drive (needed since
+  standard users search all-staff mail), plus a **RingCentral API** app
+  credential for SMS. Org-held bot credentials, not per-employee setup.
 
-This is the bulk of the net-new engineering, and it's deliberately simple.
-Everything else is OpenTag glue.
+This is the bulk of the net-new engineering. Everything else is OpenTag glue.
 
 ---
 
@@ -189,21 +234,25 @@ so this is not optional:
   end-to-end. No role gating yet — everyone can search it.
 - **Exit criteria:** "@bot what are my open Asana tasks" returns a rendered card.
 
-### Phase 1 — The two-tier role gate (the core requirement)
+### Phase 1 — The role gate, on whole-resource tools first (the core requirement)
 - Add the **role map** (admins = Davis + Clark) and **protected-resource
-  registry** (`adminOnly` transports).
-- Make `mcpTransports(role)` role-aware: shared tools always; `adminOnly` tools
-  only on admin turns. Forward the resolved role from bot → runtime in context.
-- Connect Davis's + Clark's **Gmail** as the first protected resource.
-- **Exit criteria:** an admin can search Davis's/Clark's mail; a standard user
-  asking the same gets "I don't have access to that" because the tool was never
-  loaded — verified to hold even against a deliberate prompt-injection attempt.
+  registry** (`adminOnly` transports). Forward resolved role bot → runtime.
+- Make `provisionTools(role)` role-aware: shared tools always; `adminOnly`
+  transports only on admin turns.
+- Connect Davis's + Clark's **private/shared Drives** as the first protected
+  resource — clean whole-resource gating, no boundary problem.
+- **Exit criteria:** an admin can search D&C's private Drives; a standard user
+  asking gets "I don't have access" because the tool was never loaded — verified
+  to hold against a deliberate prompt-injection attempt.
 
-### Phase 2 — Breadth
-- Add Davis's + Clark's **SMS/texts** as a protected resource (pick the SMS
-  source — see open decisions).
-- Enumerate and add the rest of the "etc." protected set (private Drive,
-  calendars, DMs) if in scope.
+### Phase 2 — Gmail (resolve §2a first), SMS, and breadth
+- **Decide the §2a mailbox boundary** (Option A/B/C). Then connect Gmail via
+  Workspace domain-wide delegation and build the role-scoped Gmail wrapper per
+  that decision.
+- Add Davis's + Clark's **texts via the RingCentral API** as an admin-only
+  resource. No off-the-shelf RingCentral MCP is assumed — plan a thin wrapper
+  tool around their REST API (auth, message search). This is the integration with
+  the most unknowns.
 - Add the remaining **shared** tools: QuickBooks, Ramp, Jotform, shared Drive,
   Calendar, Zapier — all searchable by everyone.
 - Hard **confirm-gate every write** (Ramp/QuickBooks/Gmail-send) and turn on
@@ -217,29 +266,34 @@ so this is not optional:
 
 ---
 
-## 6. Open decisions (need your input)
+## 6. Decisions
 
-1. **Confirm the role map**: admins are exactly Davis + Clark, correct? Anyone
-   else (e.g. an ops/finance lead) who should be admin?
-2. **Enumerate "…etc."**: beyond Davis's & Clark's email and texts, what else is
-   admin-only? Private Drive files? Personal calendars? Slack DMs? Be explicit —
-   anything not on the protected list is searchable by everyone.
-3. **SMS/texts source**: what carries your texts? (e.g. Google Voice, a business
-   SMS platform, iMessage export, Twilio.) This determines whether there's an MCP
-   / API to connect at all, and is the trickiest integration.
-4. **Standard-user data scope**: when a standard user "searches everything,"
-   does that include *other employees'* mailboxes, or only shared company tools
-   plus their own? (i.e. is anyone's mail searchable besides leadership's?)
-5. **Hosting**: where do bot + runtime + role/token store run? Drives the OAuth
-   callback URL and secrets management.
-6. **LLM provider**: OpenAI, Anthropic, or Google — per our data policy.
-7. **MCP sourcing**: official hosted MCP per vendor (lowest maintenance),
+### Resolved
+- ✅ **Role map**: admins are **Davis + Clark only**. No one else.
+- ✅ **Protected (admin-only) set**: Davis's & Clark's email, their texts, and
+  their private/shared Google Drives.
+- ✅ **SMS source**: **RingCentral API** (no off-the-shelf MCP assumed — thin
+  wrapper to build).
+- ✅ **Standard-user reach**: broad, **includes other employees' mailboxes**
+  (which is what surfaces the §2a boundary problem).
+
+### Still open (need your input)
+1. **§2a mailbox boundary — the big one.** Pick A (standard users get shared
+   tools + own mailbox only — clean & cheap, recommended), B (all-staff search
+   with message-level redaction of anything involving D&C), or C (accept that
+   leadership's mail-with-employees stays discoverable). This decides whether the
+   stated goal is actually achievable and how much Gmail code we write.
+2. **All-staff mailbox search — intended?** Confirm letting all employees search
+   each other's mail is a deliberate choice (privacy/HR/legal implications).
+3. **Hosting**: where do bot + runtime + role store run? Drives the OAuth
+   callback URL, the domain-wide-delegation setup, and secrets management.
+4. **LLM provider**: OpenAI, Anthropic, or Google — per our data policy.
+5. **MCP sourcing**: official hosted MCP per vendor (lowest maintenance),
    self-hosted sidecars (OpenTag's Notion pattern), or Zapier's MCP (9,000+ apps,
-   one integration). Likely a mix.
-8. **Channel scope**: org-wide, or allowlisted channels + DMs only. (Note:
-   role-gating must work in *public* channels too — if a standard user @mentions
-   the bot in a channel where an admin is present, the requester's role is what
-   counts, not who's watching.)
+   one integration). Likely a mix; RingCentral is a custom wrapper regardless.
+6. **Channel scope**: org-wide, or allowlisted channels + DMs only. (Role-gating
+   keys off the *requester's* id, so it's correct even in a public channel an
+   admin is watching.)
 
 ---
 
@@ -248,10 +302,12 @@ so this is not optional:
 | Phase | Scope | Rough effort |
 |---|---|---|
 | 0 | Skeleton + 1 shared-token tool | ~few days |
-| 1 | Two-tier role gate + leadership Gmail | ~1 week |
-| 2 | SMS + remaining tools + audit log | ~1–2 weeks |
+| 1 | Role gate + leadership Drives (whole-resource gating) | ~1 week |
+| 2 | Gmail wrapper (§2a) + RingCentral SMS + remaining tools + audit log | ~2–3 weeks |
 | 3 | Hardening, persistence, rollout | ~1 week |
 
-The role gate in Phase 1 is the core requirement but is genuinely small (a role
-check + conditional transport loading). The larger unknown is the **SMS/texts**
-source in Phase 2 — that integration may or may not exist off the shelf.
+The role gate itself is small (a role check + conditional transport loading) and
+lands cleanly in Phase 1 on the Drives. The real cost moved to Phase 2: the
+**Gmail wrapper** (size depends entirely on the §2a decision — Option A is
+trivial, Option B is the most code) and the **RingCentral SMS** wrapper, which
+has the most unknowns since there's no off-the-shelf MCP.
